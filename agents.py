@@ -3,9 +3,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from tools import web_search , scrape_url 
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 #model setup 
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", temperature=0)
