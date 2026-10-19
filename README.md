@@ -1,38 +1,42 @@
 # ResearchMind: Multi-Agent Research System
 
-ResearchMind turns a topic into a structured research report. A small team of AI steps searches the web, reads a source, writes the report, and then reviews its own work. You can use it from a Streamlit web app or straight from the terminal.
+ResearchMind turns a topic into a structured research report. It searches the web, reads several pages, retrieves the most relevant passages, writes a cited report, and then reviews its own work. You can use it from a Streamlit web app or straight from the terminal.
 
 It runs entirely on free tiers: Google Gemini for the language model and Tavily for web search.
 
 ## How it works
 
-The project runs four steps in order. Each step passes its output to the next one.
+ResearchMind uses retrieval-augmented generation (RAG). Instead of asking a model to read one page, it reads several pages, keeps only the passages that matter, and forces the writer to cite them.
 
-| Step | Component | What it does |
-|------|-----------|--------------|
-| 1 | Search Agent | Calls the Tavily web search tool and returns titles, URLs and snippets for the topic. |
-| 2 | Reader Agent | Picks the most relevant URL from the search results and scrapes the page text. |
-| 3 | Writer | Combines the search results and scraped text into a report with an introduction, key findings, a conclusion and a source list. |
-| 4 | Critic | Reviews the report and returns a score out of 10, strengths, areas to improve and a one-line verdict. |
+| Step | What it does |
+|------|--------------|
+| 1. Search | Tavily returns up to 6 sources for the topic. |
+| 2. Read pages | The pages are downloaded in parallel and cleaned. If a page cannot be read, the search snippet is used instead. |
+| 3. Index | The text is split into overlapping chunks, embedded with Gemini embeddings, and stored in a fresh Chroma collection. |
+| 4. Retrieve | The most relevant chunks are selected with MMR (maximal marginal relevance), which avoids returning the same point several times. |
+| 5. Write | Gemini writes the report using only the retrieved chunks and cites each claim as [n]. The Sources section is built from the sources actually cited. |
+| 6. Critic | A second prompt reviews the report and returns a score out of 10 with feedback. |
 
 ```
-topic --> Search Agent --> Reader Agent --> Writer --> Critic --> report + feedback
-          (Tavily)         (web scraper)    (Gemini)   (Gemini)
+topic -> search -> read pages -> chunk + embed -> Chroma -> retrieve (MMR) -> writer [n] -> critic
 ```
 
-The search agent and reader agent are tool-using agents built with LangChain. The writer and critic are prompt chains with no tools.
+### Safeguards against made-up answers
 
-### Safeguard against made-up answers
-
-Language models sometimes skip the search tool and answer from memory, which produces confident reports with no sources. The pipeline checks that the search agent really called the web search tool. If it did not, the pipeline retries once with a stricter instruction. If it still did not search, the run stops with a clear error instead of producing an unsupported report.
+- The writer sees only the retrieved excerpts and is told to say when the sources do not cover something.
+- After writing, the code checks every [n] against the real source list. Citations to sources that do not exist are flagged in the UI, and the Sources section lists only sources that were really cited.
+- Page fetching refuses local and private network addresses, limits redirects and page size, and ignores non-HTML content.
 
 ## Features
 
-- Streamlit web interface with a live four-step progress tracker
-- Critic score, time taken, and tabs for the report, the critic feedback and the raw research
+- Streamlit interface with a live six-step progress tracker
+- Metrics for critic score, sources cited and time taken
+- Tabs for the report, critic feedback, the sources that were read, and the exact passages the writer was given
 - Download of the finished report as a Markdown file
 - Clear error messages for rate limits and API key problems
-- Terminal mode for quick runs without the browser
+- Automatic retry with backoff when the embedding API is rate limited
+- Falls back to an in-memory vector store if Chroma cannot start
+- Offline tests and a setup check script
 - Free to run: no paid API required
 
 ## Requirements
@@ -109,34 +113,49 @@ The app opens at `http://localhost:8501`. Type a topic, press **Run research**, 
 python pipeline.py
 ```
 
-Enter a topic when prompted. Each step prints its output as it finishes.
+Enter a topic when prompted. The report, critic feedback and a citation summary are printed.
+
+## Check your setup
+
+```bash
+python check_setup.py
+```
+
+This tests your keys, Tavily, the Gemini chat model, the embedding model and the vector store one by one, so you can see exactly what is misconfigured.
+
+## Tests
+
+```bash
+python -m unittest discover tests
+```
+
+The tests need no API keys or internet. They cover chunking, text extraction, the private-address block, MMR retrieval, embedding retries and citation checking.
 
 ## Project structure
 
 ```
 .
 |-- app.py            Streamlit user interface
-|-- pipeline.py       Runs the four steps in order (used by the UI and the terminal)
-|-- agents.py         Model setup, the two agents, and the writer and critic prompts
-|-- tools.py          web_search (Tavily) and scrape_url (requests + BeautifulSoup)
+|-- pipeline.py       Runs the six steps (used by the UI and the terminal)
+|-- rag.py            Search, scraping, chunking, embeddings, vector store, retrieval, citations
+|-- agents.py         Gemini model setup and the critic prompt (older agent code is kept)
+|-- tools.py          Older LangChain tools (no longer used by the pipeline)
+|-- check_setup.py    Connectivity check
+|-- tests/            Offline unit tests
 |-- requirements.txt  Python dependencies
 |-- .env              Your API keys (not committed)
 `-- README.md
 ```
 
-### Key functions
-
-- `run_research_steps(topic)` in `pipeline.py` is a generator that yields an event when each step starts and finishes. The web app uses it to update the progress tracker live.
-- `run_research_pipeline(topic)` in `pipeline.py` runs every step, prints the output and returns the final results as a dictionary with the keys `search_results`, `scraped_content`, `report` and `feedback`.
-
 ## Configuration
 
-| What | Where | Notes |
-|------|-------|-------|
-| Language model | `agents.py`, the `ChatGoogleGenerativeAI(...)` line | Currently `gemini-3.5-flash-lite`. Free-tier model names change over time, so copy the current name from Google AI Studio if you see a "model not found" error. |
-| Number of search results | `tools.py`, `max_results` in `web_search` | Default is 5. |
-| Scraped text length | `tools.py`, the `[:3000]` slice in `scrape_url` | Default is 3000 characters. |
-| Report and critic format | `agents.py`, `writer_prompt` and `critic_prompt` | The score parser in `app.py` expects the critic to start with `Score: X/10`. |
+| What | Where | Default |
+|------|-------|---------|
+| Chat model | `agents.py`, the `ChatGoogleGenerativeAI(...)` line | `gemini-3.5-flash-lite`. Copy the current free-tier name from Google AI Studio if you see "model not found". |
+| Embedding model | `EMBEDDING_MODEL` in `.env` | `gemini-embedding-001` |
+| Sources per search | `RAG_MAX_RESULTS` in `.env` | 6 |
+| Vector store | `VECTOR_STORE` in `.env` (`chroma` or `memory`) | `chroma` |
+| Chunk size, overlap, top-k, MMR balance | constants at the top of `rag.py` | 1000, 150, 10, 0.6 |
 
 ## Troubleshooting
 
@@ -144,9 +163,11 @@ Enter a topic when prompted. Each step prints its output as it finishes.
 
 **Rate limit or 429 error.** The Gemini free tier has low request limits, and one run makes several model calls. Wait a minute and try again.
 
+**Embedding model not found.** Set `EMBEDDING_MODEL` in `.env` to a current embedding model from Google AI Studio, then run `python check_setup.py`.
+
 **Model not found error.** The model name in `agents.py` is no longer available on the free tier. Choose a current Flash or Flash-Lite model in Google AI Studio and update the name.
 
-**"The search agent did not run a web search" error.** The model skipped the search tool twice. Run the topic again. If it keeps happening, check that your Tavily key is valid.
+**"None of the pages could be read".** Every site blocked scraping. Try another topic or run it again.
 
 **Payment prompt in Google's console.** You started billing setup, which is not needed. Create the API key in a project without billing instead.
 
@@ -154,24 +175,23 @@ Enter a topic when prompted. Each step prints its output as it finishes.
 
 ## Limitations
 
-- This is a topic-report generator, not a fact-checker. A single search and one scraped page is thin evidence, so do not rely on it for breaking news or questions where the answer changed recently. Always check the sources it lists.
-- The reader scrapes one page and keeps the first 3000 characters, so reports reflect a limited slice of what the search found.
-- Some websites block scraping or require JavaScript, in which case the reader returns little or nothing.
-- The critic's score is shown but not used to revise the report.
-- Free-tier limits and model names can change without notice.
+- Reports are only as good as the pages found. Always check the listed sources, especially for breaking news.
+- Some websites block scraping or need JavaScript. Those pages fall back to the short search snippet.
+- The critic's score is shown but not used to revise the report yet.
+- The embedding model name and free-tier limits can change without notice.
+- The code has been unit tested offline. Run `python check_setup.py` to confirm it works with your own keys.
 
 ## Roadmap
 
-- Search several sources in parallel and cross-check them before writing
-- Pass sources as structured data so citations come from real results
-- Let the critic's feedback trigger an automatic rewrite
-- Add a fallback model (for example Groq) for when the Gemini free tier is exhausted
-- Add automatic retries for rate limits
-- Add tests and a cleaned, pinned `requirements.txt`
+- Planner that splits a topic into sub-questions answered in parallel
+- Groundedness check that verifies each claim against the retrieved text, with an automatic rewrite loop
+- Evaluation script with real metrics on a fixed set of topics
+- Docker image, public demo and a Groq fallback model
 
 ## Built with
 
-- [LangChain](https://www.langchain.com) for the agents and prompt chains
+- [LangChain](https://www.langchain.com) for prompts and model wrappers
+- [Chroma](https://www.trychroma.com) for the vector store
 - [Google Gemini](https://ai.google.dev) for the language model
 - [Tavily](https://tavily.com) for web search
 - [Streamlit](https://streamlit.io) for the user interface
