@@ -95,6 +95,9 @@ def run_pipeline(topic: str):
 
     try:
         for event in run_research_steps(topic):
+            if event["status"] == "data":  # extra results that are not a step
+                outputs[event["key"]] = event["output"]
+                continue
             states[event["step"]] = event["status"]
             if event["status"] == "done":
                 outputs[event["key"]] = event["output"]
@@ -124,8 +127,8 @@ for key, default in (("topic", ""), ("result", None), ("error", None)):
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("🔬 ResearchMind")
 st.caption(
-    "Four AI steps work together: search the web, read a source, write a report, "
-    "then critique it."
+    "Searches the web, reads several pages, retrieves the most relevant passages "
+    "with embeddings, then writes a report that cites its sources and critiques it."
 )
 
 # ── Input ─────────────────────────────────────────────────────────────────────
@@ -165,13 +168,22 @@ if result:
     score = parse_score(feedback)
 
     st.divider()
-    head_left, head_mid, head_right = st.columns([3, 1, 1])
-    head_left.subheader(f"Results: {result['topic']}")
-    head_mid.metric("Critic score", f"{score}/10" if score else "n/a")
-    head_right.metric("Time taken", f"{result['seconds']:.0f}s")
+    cites = out.get("citations", {})
+    pages = out.get("pages", [])
+    info = out.get("index_info", {})
 
-    tab_report, tab_critic, tab_raw = st.tabs(
-        ["📝 Report", "🧐 Critic feedback", "🔎 Raw research"]
+    head_left, m1, m2, m3 = st.columns([3, 1, 1, 1])
+    head_left.subheader(f"Results: {result['topic']}")
+    m1.metric("Critic score", f"{score}/10" if score else "n/a")
+    m2.metric("Sources cited", f"{len(cites.get('cited', []))}/{cites.get('total', 0)}")
+    m3.metric("Time taken", f"{result['seconds']:.0f}s")
+
+    if cites.get("invalid"):
+        st.warning("The report cites source numbers that do not exist: "
+                   + ", ".join(f"[{n}]" for n in cites["invalid"]))
+
+    tab_report, tab_critic, tab_sources, tab_chunks = st.tabs(
+        ["📝 Report", "🧐 Critic feedback", "📚 Sources", "🔎 Retrieved passages"]
     )
 
     with tab_report:
@@ -186,8 +198,17 @@ if result:
     with tab_critic:
         st.markdown(feedback)
 
-    with tab_raw:
-        with st.expander("Search Agent output", expanded=False):
-            st.markdown(out.get("search_results", ""))
-        with st.expander("Reader Agent output (scraped content)", expanded=False):
-            st.markdown(out.get("scraped_content", ""))
+    with tab_sources:
+        if info:
+            st.caption(f"{info.get('pages', 0)} pages split into {info.get('chunks', 0)} chunks "
+                       f"(vector store: {info.get('backend', 'n/a')})")
+        for p in pages:
+            how = {"scraped": "full page", "snippet": "search snippet only"}.get(p["method"], p["method"])
+            st.markdown(f"**[{p['n']}]** [{p['title']}]({p['url']})  \n"
+                        f"{p['chars']:,} characters read ({how})")
+
+    with tab_chunks:
+        st.caption("These are the passages the writer was allowed to use.")
+        for c in out.get("retrieved", []):
+            with st.expander(f"[{c['n']}] {c['title']}"):
+                st.write(c["text"])

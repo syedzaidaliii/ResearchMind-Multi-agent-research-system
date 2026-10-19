@@ -1,22 +1,17 @@
 from datetime import date
 
-from agents import build_reader_agent, build_search_agent, writer_chain, critic_chain
+import rag
+from agents import critic_chain
 
 # (key, title, description) -- the UI uses this to draw the step tracker
 STEPS = [
-    ("search", "Search Agent", "Finds recent sources on the web"),
-    ("reader", "Reader Agent", "Scrapes the most relevant page"),
-    ("writer", "Writer", "Drafts the research report"),
+    ("search", "Search", "Finds sources on the web (Tavily)"),
+    ("scrape", "Read pages", "Downloads several pages in parallel"),
+    ("index", "Index", "Chunks the text, embeds it, stores it in a vector database"),
+    ("retrieve", "Retrieve", "Picks the most relevant, non-repetitive chunks"),
+    ("writer", "Writer", "Writes the report and cites sources as [n]"),
     ("critic", "Critic", "Reviews and scores the report"),
 ]
-
-# which key of the final `state` dict each step fills
-STATE_KEYS = {
-    "search": "search_results",
-    "reader": "scraped_content",
-    "writer": "report",
-    "critic": "feedback",
-}
 
 
 def _text(content) -> str:
@@ -38,95 +33,83 @@ def _text(content) -> str:
     return str(content)
 
 
-def _used_tool(result) -> bool:
-    """True if the agent actually called a tool (its run contains a tool message)."""
-    return any(getattr(m, "type", "") == "tool" for m in result["messages"])
-
-
-STRICT_SEARCH = (
-    "You MUST call the web_search tool before answering and use ONLY what it "
-    "returns. Never answer from memory. List every source with its title and URL."
-)
-
-
 def run_research_steps(topic: str):
     """Run the pipeline step by step.
 
     Yields dicts so a UI can show live progress:
         {"step": "search", "status": "running"}
-        {"step": "search", "status": "done", "key": "search_results", "output": "..."}
+        {"step": "search", "status": "done", "key": "sources", "output": [...]}
+        {"status": "data", "key": "citations", "output": {...}}   (extra results, no step)
     """
-    state = {}
+    store = None
+    try:
+        # 1 - search
+        yield {"step": "search", "status": "running"}
+        sources = rag.search_sources(topic)
+        if not sources:
+            raise RuntimeError("The web search returned no results. Try rewording the topic.")
+        yield {"step": "search", "status": "done", "key": "sources", "output": sources}
 
-    # step 1 - search agent
-    yield {"step": "search", "status": "running"}
-    search_agent = build_search_agent()
-    search_result = search_agent.invoke({
-        "messages": [("user", f"Find recent, reliable and detailed information about: {topic}")]
-    })
-    if not _used_tool(search_result):
-        # the model answered from memory instead of searching -- try once more, strictly
-        search_result = search_agent.invoke({
-            "messages": [("user", f"{STRICT_SEARCH}\n\nTopic: {topic}")]
-        })
-        if not _used_tool(search_result):
-            raise RuntimeError(
-                "The search agent did not run a web search, so the report would not be "
-                "based on real sources. Please try again."
-            )
-    state["search_results"] = _text(search_result["messages"][-1].content)
-    yield {"step": "search", "status": "done", "key": "search_results",
-           "output": state["search_results"]}
+        # 2 - scrape pages in parallel
+        yield {"step": "scrape", "status": "running"}
+        pages = [p for p in rag.scrape_pages(sources) if p["text"]]
+        if not pages:
+            raise RuntimeError("None of the pages could be read. Try a different topic.")
+        yield {"step": "scrape", "status": "done", "key": "pages", "output": pages}
 
-    # step 2 - reader agent
-    yield {"step": "reader", "status": "running"}
-    reader_agent = build_reader_agent()
-    reader_result = reader_agent.invoke({
-        "messages": [("user",
-            f"Based on the following search results about '{topic}', "
-            f"pick the most relevant URL and scrape it for deeper content.\n\n"
-            f"Search Results:\n{state['search_results'][:3000]}"
-        )]
-    })
-    state["scraped_content"] = _text(reader_result["messages"][-1].content)
-    yield {"step": "reader", "status": "done", "key": "scraped_content",
-           "output": state["scraped_content"]}
+        # 3 - chunk, embed, store
+        yield {"step": "index", "status": "running"}
+        chunks = rag.limit_chunks(rag.chunk_pages(pages))
+        store, backend = rag.index_chunks(chunks, rag.get_embeddings())
+        yield {"step": "index", "status": "done", "key": "index_info",
+               "output": {"chunks": len(chunks), "pages": len(pages), "backend": backend}}
 
-    # step 3 - writer chain
-    yield {"step": "writer", "status": "running"}
-    research_combined = (
-        f"TODAY'S DATE: {date.today():%d %B %Y}\n\n"
-        f"SEARCH RESULTS : \n {state['search_results']} \n\n"
-        f"DETAILED SCRAPED CONTENT : \n {state['scraped_content']}"
-    )
-    state["report"] = _text(writer_chain.invoke({
-        "topic": topic,
-        "research": research_combined,
-    }))
-    yield {"step": "writer", "status": "done", "key": "report",
-           "output": state["report"]}
+        # 4 - retrieve
+        yield {"step": "retrieve", "status": "running"}
+        top = rag.retrieve(store, topic)
+        yield {"step": "retrieve", "status": "done", "key": "retrieved", "output": top}
 
-    # step 4 - critic chain
-    yield {"step": "critic", "status": "running"}
-    state["feedback"] = _text(critic_chain.invoke({"report": state["report"]}))
-    yield {"step": "critic", "status": "done", "key": "feedback",
-           "output": state["feedback"]}
+        # 5 - write with citations
+        yield {"step": "writer", "status": "running"}
+        writer = rag.build_writer_chain()
+        raw = _text(writer.invoke({
+            "topic": topic,
+            "today": f"{date.today():%d %B %Y}",
+            "sources": rag.format_sources(pages),
+            "context": rag.format_context(top),
+        }))
+        report = rag.finalize_report(raw, pages)
+        yield {"step": "writer", "status": "done", "key": "report", "output": report}
+        yield {"status": "data", "key": "citations",
+               "output": rag.check_citations(raw, [p["n"] for p in pages])}
+
+        # 6 - critic
+        yield {"step": "critic", "status": "running"}
+        feedback = _text(critic_chain.invoke({"report": report}))
+        yield {"step": "critic", "status": "done", "key": "feedback", "output": feedback}
+    finally:
+        if store is not None:
+            rag.cleanup_store(store)
 
 
 def run_research_pipeline(topic: str) -> dict:
-    """Terminal version: runs every step, prints the output, returns the state."""
+    """Terminal version: runs every step, prints a short summary, returns the results."""
     titles = {key: title for key, title, _ in STEPS}
     state = {}
 
     for event in run_research_steps(topic):
         if event["status"] == "running":
-            print("\n" + "=" * 50)
-            print(f"{titles[event['step']]} is working ...")
-            print("=" * 50)
-        else:
-            state[event["key"]] = event["output"]
-            print(f"\n{event['key']}:\n", event["output"])
-
+            print(f"\n[{titles[event['step']]}] working ...")
+            continue
+        state[event["key"]] = event["output"]
+        if event["key"] == "report":
+            print("\n" + event["output"])
+        elif event["key"] == "feedback":
+            print("\n" + event["output"])
+        elif event["key"] == "citations":
+            c = event["output"]
+            print(f"\nCitations: {len(c['cited'])}/{c['total']} sources cited, "
+                  f"{len(c['invalid'])} invalid")
     return state
 
 
